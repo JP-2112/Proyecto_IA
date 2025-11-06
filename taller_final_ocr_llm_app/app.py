@@ -139,6 +139,16 @@ def build_prompt(task_name: str, text: str):
     else:
         return f"Deliver a clear, structured explanation of the following text focusing on the key ideas:\n\n{text}"
 
+# === NUEVO: seleccionar modelo HF compatible según la tarea (fallback automático) ===
+def pick_hf_model(task_name: str, chosen: str) -> str:
+    # Para resumir, forzar BART (summarization)
+    if task_name == "Resumir en 3 puntos clave":
+        return "facebook/bart-large-cnn"
+    # Para el resto necesitamos text-generation; si el usuario dejó BART, cambiamos a Mistral
+    if "bart" in (chosen or "").lower():
+        return "mistralai/Mistral-7B-Instruct-v0.3"
+    return chosen
+
 analyze = st.button("🤖 Analizar Texto")
 
 if analyze:
@@ -159,15 +169,18 @@ if analyze:
                 if not HUGGINGFACE_API_KEY:
                     st.error("Falta HUGGINGFACE_API_KEY en tu .env")
                 else:
+                    # Usar modelo compatible según la tarea
+                    hf_used = pick_hf_model(task, hf_model)
+
                     if task == "Resumir en 3 puntos clave":
-                        out = hf_summarization(text, model_id=hf_model if "bart" in hf_model else "facebook/bart-large-cnn")
+                        out = hf_summarization(text, model_id=hf_used)
                     elif task == "Traducir al inglés":
                         prompt = f"Translate the following Spanish text into English:\n\n{text}"
-                        out = hf_text_generation(prompt, model_id=hf_model, temperature=temperature, max_tokens=max_tokens)
+                        out = hf_text_generation(prompt, model_id=hf_used, temperature=temperature, max_tokens=max_tokens)
                     else:
                         # Generic instruction using text-generation
                         prompt = build_prompt(task, text)
-                        out = hf_text_generation(prompt, model_id=hf_model, temperature=temperature, max_tokens=max_tokens)
+                        out = hf_text_generation(prompt, model_id=hf_used, temperature=temperature, max_tokens=max_tokens)
 
                     st.markdown("**Salida (Hugging Face):**")
                     st.markdown(out)
