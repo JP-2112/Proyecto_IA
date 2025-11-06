@@ -1,0 +1,7 @@
+streamlit==1.38.0
+python-dotenv
+Pillow
+numpy
+easyocr
+groq
+huggingface_hub
