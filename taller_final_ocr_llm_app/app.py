@@ -26,7 +26,6 @@ def do_ocr(image: Image.Image):
     return "\n".join(results).strip()
 
 def groq_chat_completion(prompt, model_name, temperature, max_tokens):
-    # Uses Groq python SDK
     try:
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
@@ -43,35 +42,53 @@ def groq_chat_completion(prompt, model_name, temperature, max_tokens):
     except Exception as e:
         return f"⚠️ Error calling GROQ API: {e}"
 
-def hf_summarization(text, model_id="facebook/bart-large-cnn"):
-    # Uses huggingface_hub InferenceClient
+# ===== Hugging Face helpers (robustos por tarea) =====
+def hf_post(task: str, inputs: str, model_id: str, extra: dict | None = None):
+    """Wrapper estable usando client.post para cualquier task soportada."""
     try:
         from huggingface_hub import InferenceClient
         client = InferenceClient(token=HUGGINGFACE_API_KEY)
-        # InferenceClient provides .summarization; if unavailable in your version,
-        # you can switch to client.post(json=...) with task="summarization".
-        summary = client.summarization(text=text, model=model_id, max_new_tokens=256)
-        # .summarization returns str in recent versions
-        if isinstance(summary, dict) and "summary_text" in summary:
-            return summary["summary_text"]
-        return str(summary)
+        payload = {"inputs": inputs}
+        if extra:
+            payload.update(extra)
+        out = client.post(json=payload, task=task, model=model_id)
+        # Normalizar salida (puede venir como str, dict o lista)
+        if isinstance(out, str):
+            return out
+        if isinstance(out, list) and out and isinstance(out[0], dict):
+            # típicamente [{'summary_text': '...'}] o [{'translation_text': '...'}]
+            return out[0].get("summary_text") or out[0].get("translation_text") or str(out[0])
+        if isinstance(out, dict):
+            return out.get("generated_text") or out.get("summary_text") or out.get("translation_text") or str(out)
+        return str(out)
     except Exception as e:
         return f"⚠️ Error calling Hugging Face Inference API: {e}"
 
-def hf_text_generation(prompt, model_id="mistralai/Mistral-7B-Instruct-v0.3", temperature=0.3, max_tokens=256):
-    try:
-        from huggingface_hub import InferenceClient
-        client = InferenceClient(model=model_id, token=HUGGINGFACE_API_KEY)
-        generated = client.text_generation(
-            prompt,
-            max_new_tokens=int(max_tokens),
-            temperature=float(temperature),
-            do_sample=True,
-            stream=False,
+def hf_summarization(text: str, model_id="facebook/bart-large-cnn"):
+    # Evito kwargs incompatibles entre versiones (max_length/max_new_tokens).
+    return hf_post(task="summarization", inputs=text, model_id=model_id)
+
+def hf_translate_es_en(text: str, model_id="Helsinki-NLP/opus-mt-es-en"):
+    # Traducción dedicada (mucho más estable que pedirle a un LLM generativo).
+    return hf_post(task="translation", inputs=text, model_id=model_id)
+
+def hf_text_generation(prompt: str, model_id="Qwen/Qwen2.5-0.5B-Instruct", temperature=0.3, max_tokens=256):
+    # Intento con text-generation. Si el modelo no soporta ese task, hago fallback a un T5 (text2text).
+    out = hf_post(
+        task="text-generation",
+        inputs=prompt,
+        model_id=model_id,
+        extra={"parameters": {"max_new_tokens": int(max_tokens), "temperature": float(temperature)}},
+    )
+    # Si el backend se queja de "conversational" u otro task, pruebo text2text con FLAN-T5.
+    if "not supported for task" in str(out).lower():
+        out = hf_post(
+            task="text2text-generation",
+            inputs=prompt,
+            model_id="google/flan-t5-base",
+            extra={"parameters": {"max_new_tokens": int(max_tokens)}},
         )
-        return generated
-    except Exception as e:
-        return f"⚠️ Error calling Hugging Face text-generation: {e}"
+    return out
 
 # ====== Streamlit UI ======
 st.set_page_config(page_title="Taller IA: OCR + LLM", page_icon="🧠", layout="wide")
@@ -93,7 +110,11 @@ with st.sidebar:
     else:
         hf_model = st.selectbox(
             "Modelo Hugging Face (task depende abajo)",
-            ["facebook/bart-large-cnn", "mistralai/Mistral-7B-Instruct-v0.3"],
+            [
+                "facebook/bart-large-cnn",        # summarization
+                "Qwen/Qwen2.5-0.5B-Instruct",     # text-generation
+                "Helsinki-NLP/opus-mt-es-en",     # translation
+            ],
             index=0
         )
 
@@ -125,13 +146,12 @@ task = st.selectbox(
     ["Resumir en 3 puntos clave", "Identificar entidades principales", "Traducir al inglés", "Explicación general"]
 )
 
-# Compose prompt from task
 def build_prompt(task_name: str, text: str):
     if task_name == "Resumir en 3 puntos clave":
         return f"Resume el siguiente texto en exactamente 3 viñetas claras y concisas:\n\nTexto:\n{text}"
     elif task_name == "Identificar entidades principales":
         return (
-            "Extrae ENTIDADES (Personas, Organizaciones, Lugares, Fechas) y muéstralas en lista con categoría y valor. "
+            "Extrae ENTIDADES (Personas, Organizaciones, Lugares, Fechas) y muéstralas en lista con categoría y valor.\n"
             f"Texto:\n{text}"
         )
     elif task_name == "Traducir al inglés":
@@ -139,15 +159,17 @@ def build_prompt(task_name: str, text: str):
     else:
         return f"Deliver a clear, structured explanation of the following text focusing on the key ideas:\n\n{text}"
 
-# === NUEVO: seleccionar modelo HF compatible según la tarea (fallback automático) ===
+# Auto-selección de modelo HF válido por tarea
 def pick_hf_model(task_name: str, chosen: str) -> str:
-    # Para resumir, forzar BART (summarization)
     if task_name == "Resumir en 3 puntos clave":
         return "facebook/bart-large-cnn"
-    # Para el resto necesitamos text-generation; si el usuario dejó BART, cambiamos a Mistral
+    if task_name == "Traducir al inglés":
+        return "Helsinki-NLP/opus-mt-es-en"
+    # Entidades / Explicación -> generativo
+    # Si el usuario dejó BART (incompatible), forzamos Qwen
     if "bart" in (chosen or "").lower():
-        return "mistralai/Mistral-7B-Instruct-v0.3"
-    return chosen
+        return "Qwen/Qwen2.5-0.5B-Instruct"
+    return chosen or "Qwen/Qwen2.5-0.5B-Instruct"
 
 analyze = st.button("🤖 Analizar Texto")
 
@@ -169,18 +191,20 @@ if analyze:
                 if not HUGGINGFACE_API_KEY:
                     st.error("Falta HUGGINGFACE_API_KEY en tu .env")
                 else:
-                    # Usar modelo compatible según la tarea
                     hf_used = pick_hf_model(task, hf_model)
 
                     if task == "Resumir en 3 puntos clave":
                         out = hf_summarization(text, model_id=hf_used)
                     elif task == "Traducir al inglés":
-                        prompt = f"Translate the following Spanish text into English:\n\n{text}"
-                        out = hf_text_generation(prompt, model_id=hf_used, temperature=temperature, max_tokens=max_tokens)
+                        out = hf_translate_es_en(text, model_id=hf_used)
                     else:
-                        # Generic instruction using text-generation
                         prompt = build_prompt(task, text)
-                        out = hf_text_generation(prompt, model_id=hf_used, temperature=temperature, max_tokens=max_tokens)
+                        out = hf_text_generation(
+                            prompt,
+                            model_id=hf_used,
+                            temperature=temperature,
+                            max_tokens=max_tokens
+                        )
 
                     st.markdown("**Salida (Hugging Face):**")
                     st.markdown(out)
